@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     process::Command,
     str::FromStr,
+    time,
 };
 
 use clap::Parser;
@@ -52,7 +53,7 @@ where
 
 fn handle_connection(stream: TcpStream, options: &Args) {
     let reader = stream.try_clone().unwrap();
-    let writer = stream;
+    let mut writer = stream;
     let mut reader = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::new();
 
@@ -70,6 +71,10 @@ fn handle_connection(stream: TcpStream, options: &Args) {
         let mut req = Request::new(&mut headers);
         let result = req.parse(&buf).unwrap();
         if result.is_complete() {
+            if req.method.unwrap() != "POST" {
+                write!(writer, "HTTP/1.1 200 OK\r\n\r\nNot Supported").unwrap();
+                return;
+            }
             eprintln!("is complete");
             let header_len = result.unwrap();
             dbg!(header_len);
@@ -79,7 +84,6 @@ fn handle_connection(stream: TcpStream, options: &Args) {
             let boundary = parse_boundary(&content_type);
             dbg!(&content_type);
             let body_received = &buf[header_len - b"\r\n".len()..];
-            // dbg!(std::str::from_utf8(&body_received[..64]));
             let body = body_received.chain(reader.into_inner());
             handle_request(body, boundary, content_len, writer, options);
             break 'outer;
@@ -187,9 +191,12 @@ fn handle_request(
         }
         state = match state {
             State::Start => {
-                // dbg!(std::str::from_utf8(&buf[..30]));
-                let next_boundary = memmem::find(buf, boundary.as_bytes()).unwrap();
-                State::FoundBoundary(next_boundary + boundary.len())
+                if let Some(next_boundary) = memmem::find(buf, boundary.as_bytes()) {
+                    State::FoundBoundary(next_boundary + boundary.len())
+                } else {
+                    buffer.consume_and_read(0, &mut body);
+                    State::Start
+                }
             }
             State::FoundBoundary(boundary_end) => {
                 let remaining = &buf[boundary_end..];
@@ -203,6 +210,9 @@ fn handle_request(
                     let headers = remaining[2..headers_end].lines();
                     let filename = parse_file_name(headers);
                     dbg!(&filename);
+                    if filename.is_empty() {
+                        break;
+                    }
                     let path = tmp_dir.clone().join(filename);
                     let file = File::create(&path).unwrap();
                     let tmp_file = TmpFile { path, file };
@@ -219,7 +229,7 @@ fn handle_request(
                     let boundary_end = next_boundary + boundary.len();
                     tmp_file
                         .file
-                        .write_all(&remaining[start..next_boundary])
+                        .write_all(&remaining[..next_boundary])
                         .unwrap();
                     tmp_file.finalize(options);
                     State::FoundBoundary(boundary_end + start)
@@ -250,22 +260,17 @@ fn handle_request(
     }
 
     let mut writer = BufWriter::new(writer);
+    write!(
+        writer,
+        "HTTP/1.1 303 See Other\r\nLocation: ../upload\r\n\r\n"
+    )
+    .unwrap();
+    drop(writer);
+
     if let Some(shell_cmd) = &options.cmd {
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(shell_cmd);
-        let output = cmd.output().unwrap();
-        let stdout = output.stdout;
-        let stderr = output.stderr;
-        let status = output.status;
-        write!(
-            writer,
-            "HTTP/1.1 200 OK\r\n\r\nCommand: {shell_cmd}\r\nExit status: {status} \r\nOutput: \r\n"
-        )
-        .unwrap();
-        writer.write_all(stdout.as_slice()).unwrap();
-        writer.write_all(stderr.as_slice()).unwrap();
-    } else {
-        write!(writer, "HTTP/1.1 200 OK\r\n\r\nUploaded.").unwrap();
+        cmd.spawn().unwrap();
     }
 }
 
