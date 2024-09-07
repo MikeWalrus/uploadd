@@ -1,12 +1,11 @@
 #![feature(let_chains)]
 use std::{
-    fs::{create_dir, rename, File},
+    fs::{create_dir, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::Command,
     str::FromStr,
-    time,
 };
 
 use clap::Parser;
@@ -172,7 +171,7 @@ fn handle_request(
     writer: TcpStream,
     options: &Args,
 ) {
-    let tmp_dir = PathBuf::from("/tmp/upload_file");
+    let tmp_dir = PathBuf::from("/tmp/uploadd");
     if !tmp_dir.exists() {
         create_dir(&tmp_dir).unwrap();
     }
