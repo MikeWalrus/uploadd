@@ -1,23 +1,35 @@
-#![feature(core_io_borrowed_buf)]
-#![feature(read_buf)]
 #![feature(let_chains)]
-#![feature(new_uninit)]
-#![feature(maybe_uninit_slice)]
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    fs::{create_dir, rename, File},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::Command,
     str::FromStr,
 };
 
+use clap::Parser;
+use fs_extra::{file::move_file, file::CopyOptions};
 use httparse::{Header, Request};
 use memchr::{arch::all::is_prefix, memmem};
 
+#[derive(Parser)]
+struct Args {
+    #[arg(short, long)]
+    output_dir: String,
+
+    #[arg(short, long)]
+    cmd: Option<String>,
+}
+
 fn main() {
+    let options = Args::parse();
+
     let listener = TcpListener::bind("127.0.0.1:12141").unwrap();
 
     for stream in listener.incoming() {
         let stream = stream.unwrap();
-        handle_connection(stream);
+        handle_connection(stream, &options);
         println!("Connection established!");
     }
 }
@@ -27,14 +39,18 @@ where
     T: FromStr,
     T::Err: std::fmt::Debug,
 {
-    let header = headers.iter().find(|h| h.name == name).unwrap();
+    let name = name.to_owned().to_ascii_lowercase();
+    let header = headers
+        .iter()
+        .find(|h| h.name.to_owned().to_ascii_lowercase() == name)
+        .unwrap();
     std::str::from_utf8(header.value)
         .unwrap()
         .parse::<T>()
         .unwrap()
 }
 
-fn handle_connection(stream: TcpStream) {
+fn handle_connection(stream: TcpStream, options: &Args) {
     let reader = stream.try_clone().unwrap();
     let writer = stream;
     let mut reader = BufReader::new(reader);
@@ -56,6 +72,8 @@ fn handle_connection(stream: TcpStream) {
         if result.is_complete() {
             eprintln!("is complete");
             let header_len = result.unwrap();
+            dbg!(header_len);
+            dbg!(&headers);
             let content_len: usize = find_header_value(&headers, "Content-Length");
             let content_type: String = find_header_value(&headers, "Content-Type");
             let boundary = parse_boundary(&content_type);
@@ -63,7 +81,7 @@ fn handle_connection(stream: TcpStream) {
             let body_received = &buf[header_len - b"\r\n".len()..];
             // dbg!(std::str::from_utf8(&body_received[..64]));
             let body = body_received.chain(reader.into_inner());
-            handle_request(body, boundary, content_len, writer);
+            handle_request(body, boundary, content_len, writer, options);
             break 'outer;
         }
         eprintln!("is not complete");
@@ -113,7 +131,7 @@ impl Buf {
 enum State {
     Start,
     FoundBoundary(usize),
-    ReceivingFile(usize),
+    ReceivingFile(usize, TmpFile),
 }
 
 impl State {
@@ -122,17 +140,49 @@ impl State {
     }
 }
 
-fn handle_request(mut body: impl Read, boundary: &str, _content_len: usize, mut writer: TcpStream) {
+#[derive(Debug)]
+struct TmpFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl TmpFile {
+    fn finalize(self, options: &Args) {
+        move_file(
+            &self.path,
+            PathBuf::from(&options.output_dir).join(self.path.file_name().unwrap()),
+            &CopyOptions {
+                overwrite: true,
+                skip_exist: false,
+                buffer_size: 64000,
+            },
+        )
+        .unwrap();
+    }
+}
+
+fn handle_request(
+    mut body: impl Read,
+    boundary: &str,
+    _content_len: usize,
+    writer: TcpStream,
+    options: &Args,
+) {
+    let tmp_dir = PathBuf::from("/tmp/upload_file");
+    if !tmp_dir.exists() {
+        create_dir(&tmp_dir).unwrap();
+    }
+
     let boundary = format!("\r\n--{boundary}");
     dbg!(&boundary);
 
-    let mut buffer = Buf::with_capacity(65536);
+    let mut buffer = Buf::with_capacity(1024);
     buffer.consume_and_read(0, &mut body);
     let mut state = State::new();
 
     loop {
         let buf = buffer.buf();
-        if !matches!(state, State::ReceivingFile(_)) {
+        if !matches!(state, State::ReceivingFile(_, _)) {
             dbg!(&state);
         }
         state = match state {
@@ -153,22 +203,25 @@ fn handle_request(mut body: impl Read, boundary: &str, _content_len: usize, mut 
                     let headers = remaining[2..headers_end].lines();
                     let filename = parse_file_name(headers);
                     dbg!(&filename);
-                    State::ReceivingFile(boundary_end + headers_end)
+                    let path = tmp_dir.clone().join(filename);
+                    let file = File::create(&path).unwrap();
+                    let tmp_file = TmpFile { path, file };
+                    State::ReceivingFile(boundary_end + headers_end + b"\r\n\r\n".len(), tmp_file)
                 } else {
                     assert!(boundary_end != 0);
                     buffer.consume_and_read(boundary_end, &mut body);
                     State::FoundBoundary(0)
                 }
             }
-            State::ReceivingFile(start) => {
+            State::ReceivingFile(start, mut tmp_file) => {
                 let remaining = &buf[start..];
                 if let Some(next_boundary) = memmem::find(remaining, boundary.as_bytes()) {
                     let boundary_end = next_boundary + boundary.len();
-                    // write file
-                    // dbg!(std::str::from_utf8(
-                    //     &remaining[boundary_end..boundary_end + 30]
-                    // ));
-                    // buffer.consume_and_read(boundary_end + start, &mut body);
+                    tmp_file
+                        .file
+                        .write_all(&remaining[start..next_boundary])
+                        .unwrap();
+                    tmp_file.finalize(options);
                     State::FoundBoundary(boundary_end + start)
                 } else {
                     let consume_amt = if remaining.len() + 1 >= boundary.len() {
@@ -177,83 +230,43 @@ fn handle_request(mut body: impl Read, boundary: &str, _content_len: usize, mut 
                         if let Some(maybe_next_boundary) = (0..suffix.len() - 1)
                             .find(|&start| is_prefix(boundary.as_bytes(), &suffix[start..]))
                         {
-                            // write until that
                             dbg!(maybe_next_boundary);
                             let consume_len = buf.len() - suffix.len() + maybe_next_boundary;
                             let suspected_boundary = std::str::from_utf8(&buf[consume_len..]);
                             dbg!(suspected_boundary.unwrap());
                             consume_len
                         } else {
-                            // write to the end
                             buf.len()
                         }
                     } else {
-                        // write to the end
                         buf.len()
                     };
+                    tmp_file.file.write_all(&buf[start..consume_amt]).unwrap();
                     buffer.consume_and_read(consume_amt, &mut body);
-                    State::ReceivingFile(0)
+                    State::ReceivingFile(0, tmp_file)
                 }
             }
         };
-
-        /*
-        let mut boundaries = memmem::find_iter(buf, boundary.as_bytes());
-
-        let mut remaining;
-        let boundary_found;
-        if let Some(this_boundary) = boundaries.next() {
-            let this_boundary_end = this_boundary + boundary.len();
-            dbg!(std::str::from_utf8(
-                &buf[this_boundary..this_boundary + 120]
-            ));
-            if buf[this_boundary_end..].starts_with(b"--") {
-                // write and close file
-                break;
-            }
-            let part_start = this_boundary_end + b"\r\n".len();
-            const MAX_HEADER_LEN: usize = 1024;
-            let headers = &buf[part_start..];
-            let headers_end = memmem::find(headers, b"\r\n\r\n").unwrap();
-            let headers = headers[..headers_end].lines();
-            let filename = parse_file_name(headers);
-            dbg!(&filename);
-            remaining = &buf[headers_end + b"\r\n\r\n".len()..];
-            boundary_found = true;
-        } else {
-            remaining = buf;
-            boundary_found = false;
-        };
-
-        let consume_amt = if boundary_found && let Some(next_boundary) = boundaries.next() {
-            // write until boundary
-            dbg!(next_boundary);
-            next_boundary
-        } else {
-            // check buffer suffix
-            //dbg!(remaining.len());
-            let suffix = &remaining[remaining.len() - boundary.len() + 1..];
-
-            if let Some(maybe_next_boundary) = (0..suffix.len() - 1)
-                .find(|&start| is_prefix(boundary.as_bytes(), &suffix[start..]))
-            {
-                // write until that
-                dbg!(maybe_next_boundary);
-                let consume_len = buf.len() - suffix.len() + maybe_next_boundary;
-                dbg!(std::str::from_utf8(&buf[consume_len..]));
-                consume_len
-            } else {
-                // write to the end
-                buf.len()
-            }
-        };
-        //dbg!(consume_amt);
-        // buffer.consume_and_read(consume_amt, &mut body);
-        */
     }
 
-    let response = "HTTP/1.1 200 OK\r\n\r\nUploaded.";
-    writer.write_all(response.as_bytes()).unwrap();
+    let mut writer = BufWriter::new(writer);
+    if let Some(shell_cmd) = &options.cmd {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(shell_cmd);
+        let output = cmd.output().unwrap();
+        let stdout = output.stdout;
+        let stderr = output.stderr;
+        let status = output.status;
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\n\r\nCommand: {shell_cmd}\r\nExit status: {status} \r\nOutput: \r\n"
+        )
+        .unwrap();
+        writer.write_all(stdout.as_slice()).unwrap();
+        writer.write_all(stderr.as_slice()).unwrap();
+    } else {
+        write!(writer, "HTTP/1.1 200 OK\r\n\r\nUploaded.").unwrap();
+    }
 }
 
 fn parse_file_name(headers: std::io::Lines<&[u8]>) -> String {
