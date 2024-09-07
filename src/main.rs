@@ -179,7 +179,7 @@ fn handle_request(
     let boundary = format!("\r\n--{boundary}");
     dbg!(&boundary);
 
-    let mut buffer = Buf::with_capacity(1024);
+    let mut buffer = Buf::with_capacity(65536);
     buffer.consume_and_read(0, &mut body);
     let mut state = State::new();
 
